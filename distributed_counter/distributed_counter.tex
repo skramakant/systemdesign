@@ -1,0 +1,311 @@
+\documentclass[11pt, a4paper]{article}
+
+% --- UNIVERSAL PREAMBLE BLOCK ---
+\usepackage[a4paper, top=2.5cm, bottom=2.5cm, left=2cm, right=2cm]{geometry}
+\usepackage{fontspec}
+
+\usepackage[english, bidi=basic, provide=*]{babel}
+
+\babelprovide[import, onchar=ids fonts]{english}
+
+% Set default/Latin font to Sans Serif (Noto Sans)
+\babelfont{rm}{Noto Sans}
+
+% --- PACKAGES ---
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{enumitem}
+\usepackage{graphicx} 
+\usepackage{booktabs} 
+
+% --- STYLING ---
+\definecolor{primary}{RGB}{0, 85, 150}
+\definecolor{secondary}{RGB}{240, 240, 240}
+\definecolor{codebg}{RGB}{245, 245, 245}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=primary,
+    filecolor=magenta,      
+    urlcolor=cyan,
+}
+
+% Box for "Educator's Note"
+\newtcolorbox{educatornote}[1][]{
+    colback=blue!5!white,
+    colframe=primary,
+    title=\textbf{Educator's Note},
+    fonttitle=\bfseries,
+    #1
+}
+
+% Box for "Deep Dive"
+\newtcolorbox{deepdive}[1][]{
+    colback=red!5!white,
+    colframe=red!75!black,
+    title=\textbf{Deep Dive: Under the Hood},
+    fonttitle=\bfseries,
+    #1
+}
+
+% Header/Footer
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\textbf{Distributed Systems Masterclass}}
+\lhead{High-Scale Counter Architecture}
+\cfoot{\thepage}
+
+\title{\textbf{\Huge The 25 Million TPS Challenge}\\ \Large Architecture of a Massive Scale Distributed Counter System}
+\author{\textbf{System Design Masterclass}}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+    This document serves as a comprehensive technical guide to designing a distributed system capable of handling 25 million write operations per second (concurrent). It moves beyond high-level abstractions to explore the physical limitations of hardware, the physics of network packets, kernel-level interrupt handling (NAPI), and advanced aggregation patterns required to survive "Web Scale" traffic.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{The Problem Statement}
+
+Imagine you are the Lead Architect for a streaming platform hosting the \textbf{World Cup Final}. 
+\begin{itemize}
+    \item \textbf{Traffic:} 25 Million concurrent users.
+    \item \textbf{Event:} Every user clicks a "Like" button or sends a heartbeat simultaneously.
+    \item \textbf{Throughput:} 25 Million Writes Per Second (WPS).
+    \item \textbf{Latency Requirement:} Updates must be reflected globally within 3 seconds.
+    \item \textbf{Constraint:} High Availability (Active-Active). The system cannot go down.
+\end{itemize}
+
+\begin{educatornote}
+    \textbf{Why this breaks standard architectures:}
+    A standard database (Postgres/MySQL) handles ~10k TPS. A standard Kafka broker handles ~100k TPS. To handle 25M TPS directly, you would need clusters of thousands of servers, which is cost-prohibitive and operationally impossible to manage. We must change the \textit{physics} of the data.
+\end{educatornote}
+
+\section{Phase 1: The Network Entry (The Front Door)}
+
+Before a packet even hits our servers, it must traverse the global internet.
+
+\subsection{Geo-DNS and Route Optimization}
+When a user in Mumbai clicks "Like", the request does not go to a server in Virginia. We use \textbf{Geo-DNS}.
+\begin{enumerate}
+    \item The client resolves \texttt{api.live.com}.
+    \item The Name Server checks the client's Source IP.
+    \item If IP is Asia-based, it returns the VIP (Virtual IP) of the Mumbai Data Center.
+\end{enumerate}
+
+\subsection{Anycast Routing (BGP)}
+For high availability, we use \textbf{Anycast}.
+\begin{itemize}
+    \item Multiple Data Centers (Mumbai, Singapore, Tokyo) announce the \textit{same} IP address range via BGP (Border Gateway Protocol).
+    \item Internet routers (Core/Backbone) calculate the shortest topological path (lowest hops).
+    \item \textbf{Failover:} If the Mumbai DC goes dark (stops announcing BGP), routers automatically shift the next packet to Singapore. This happens at the network hardware layer, transparent to the user.
+\end{itemize}
+
+\section{Phase 2: The Physics of the Edge (Deep Dive)}
+
+This section explains why we cannot simply "scale up" bandwidth. We run into the limitations of the CPU and OS Kernel.
+
+\subsection{The Network Packet Tax}
+The user sends a payload of just 4 bytes: \texttt{\{id: 999\}}. However, the internet requires wrapping.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|c|l|}
+\hline
+\textbf{Layer} & \textbf{Size (Bytes)} & \textbf{Purpose} \\
+\hline
+Ethernet Header & 14 & MAC Addresses (Physical Routing) \\
+IP Header & 20 & IP Addresses (Logical Routing) \\
+TCP Header & 20 & Sequence Numbers, Flags, Ports \\
+HTTP Headers & ~100+ & Host, User-Agent, Cookies, Content-Length \\
+\textbf{Payload} & \textbf{4} & \textbf{The actual data} \\
+\hline
+\textbf{Total} & \textbf{~158} & \\
+\hline
+\end{tabular}
+\end{table}
+
+\[ \text{Efficiency} = \frac{4}{158} \approx 2.5\% \]
+
+We are wasting 97.5\% of our bandwidth on headers.
+
+\subsection{The Interrupt Storm (Why CPUs Die)}
+If we allow 25 million packets per second (PPS) to hit our servers, we trigger an \textbf{Interrupt Storm}.
+
+\begin{deepdive}
+    \textbf{The Life of a Packet (Kernel Level):}
+    \begin{enumerate}
+        \item \textbf{NIC (Network Interface Card):} Receives electrical signal. Uses DMA to copy packet to a Ring Buffer in RAM.
+        \item \textbf{IRQ (Hard Interrupt):} NIC signals the CPU: "Stop! Data is here."
+        \item \textbf{Context Switch 1:} CPU freezes the Application (User Mode), saves registers, switches to Kernel Mode.
+        \item \textbf{ISR (Interrupt Service Routine):} CPU acknowledges the interrupt.
+        \item \textbf{SoftIRQ:} The Kernel processes the packet (Checksums, Firewall rules).
+        \item \textbf{Context Switch 2:} CPU copies data to the Socket Buffer and switches back to User Mode.
+    \end{enumerate}
+    
+    \textbf{The Math:} A context switch takes $\approx 1 \mu s$. At 1M PPS, the CPU spends 1 second per second just switching context. Utilization hits 100\% with 0\% application work done.
+\end{deepdive}
+
+\subsection{The Solution: Edge Aggregation (Micro-Batching)}
+To solve this, we place \textbf{Edge Servers} (Golang/Rust/Nginx) at the network edge.
+
+\textbf{The Logic:}
+\begin{enumerate}
+    \item Accept the TCP connection.
+    \item Read the HTTP Request.
+    \item \textbf{DO NOT} call the database. \textbf{DO NOT} call Kafka yet.
+    \item Update a local variable in RAM: \texttt{local\_counters[match\_id]++}.
+    \item Return \texttt{200 OK} immediately.
+\end{enumerate}
+
+\textbf{The Flush (NAPI Logic applied to App Layer):}
+Every 1 second, a background timer wakes up. It takes the value (e.g., 5,000) and sends \textbf{ONE} message to the backend.
+
+\textbf{Impact:}
+\begin{itemize}
+    \item Input: 25,000 requests/sec (per server).
+    \item Output: 1 message/sec (per server).
+    \item \textbf{Reduction Factor:} 25,000x.
+\end{itemize}
+
+\subsection{The Financial Impact: To Batch or Not to Batch?}
+A simple architectural decision—whether to write directly to Kafka or aggregate at the edge—has massive financial and operational implications.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Metric} & \textbf{Without Edge Aggregation} & \textbf{With Edge Aggregation} \\ \midrule
+\textbf{Write Volume} & 25,000,000 writes/sec & ~1,000 writes/sec (from 1k Edge Nodes) \\
+\textbf{Kafka Cluster Size} & ~250+ High-End Brokers & 3 Brokers (Minimum Cluster) \\
+\textbf{Network Efficiency} & ~3\% Data / 97\% Overhead & ~99\% Data / 1\% Overhead \\
+\textbf{Consumer Nodes} & 1000+ CPUs to process stream & ~2-4 CPUs to process stream \\
+\textbf{Est. Monthly Cost} & \textbf{\$150,000+} & \textbf{\$5,000} \\ \bottomrule
+\end{tabular}
+\caption{Infrastructure comparison: Direct Writes vs. Edge Aggregation}
+\end{table}
+
+\begin{educatornote}
+    \textbf{Key Takeaway:} 
+    In the "Without Aggregation" model, you are paying primarily for processing TCP headers and context switches, not for processing business value. The "Edge Aggregation" model shifts the complexity to the cheapest resource (RAM on the Edge) to save the most expensive resource (Network IO and Downstream Compute).
+\end{educatornote}
+
+\section{Phase 3: The Data Pipeline (Ingestion)}
+
+Now that we have compressed the traffic, we send it to the backend.
+
+\subsection{Kafka Architecture}
+Even with aggregation, we have thousands of Edge Servers sending data.
+
+\begin{educatornote}
+    \textbf{The Hot Key Trap:}
+    A Junior Engineer partitions Kafka by \texttt{MatchID}.
+    \begin{itemize}
+        \item \texttt{hash(Match\_999) \% 1000 Partitions = Partition 42}.
+        \item All traffic for the World Cup hits Partition 42.
+        \item Partition 42 crashes. The system fails.
+    \end{itemize}
+\end{educatornote}
+
+\textbf{The Senior Solution: Random Partitioning}
+We configure the Kafka Producer on the Edge Server to use a \textbf{Round-Robin} or \textbf{Random} strategy.
+\begin{itemize}
+    \item Message 1 for Match 999 $\rightarrow$ Partition 0.
+    \item Message 2 for Match 999 $\rightarrow$ Partition 1.
+    \item Message 3 for Match 999 $\rightarrow$ Partition 2.
+\end{itemize}
+This spreads the load evenly across the entire Kafka cluster.
+
+\section{Phase 4: Stream Processing (Map-Reduce)}
+
+Since data for Match 999 is now scattered across all partitions, we need to sum it up. We use a \textbf{Stream Processor} (Flink, Spark, or custom Go consumers).
+
+\subsection{The Map Phase}
+We have 100 Consumers reading from 100 Kafka partitions.
+\begin{itemize}
+    \item Consumer A reads Partition 0. It sees: \texttt{\{match:999, val:500\}}.
+    \item Consumer B reads Partition 1. It sees: \texttt{\{match:999, val:200\}}.
+\end{itemize}
+Each consumer maintains a local sum in its own memory.
+
+\subsection{The Reduce Phase}
+Every few seconds, the consumers flush their local sums to the \textbf{Global Store}.
+
+\section{Phase 5: Global Consistency (Active-Active)}
+
+We have data centers in India and the US. How do we keep them in sync?
+
+\subsection{The Architecture}
+\begin{itemize}
+    \item \textbf{Region A (India):} Has its own Edge, Kafka, and Consumers. Calculates a "Region A Total".
+    \item \textbf{Region B (US):} Has its own Edge, Kafka, and Consumers. Calculates a "Region B Total".
+\end{itemize}
+
+\subsection{Global Aggregation}
+We do not replicate the raw stream (too expensive). We replicate the \textbf{result}.
+\begin{itemize}
+    \item A Global Service reads \texttt{Total\_A} and \texttt{Total\_B}.
+    \item \texttt{Global\_Total = Total\_A + Total\_B}.
+    \item This value is written to a Global Cache (e.g., Redis backed by CRDTs or simply aggregated on read).
+\end{itemize}
+
+\section{Phase 6: Probabilistic Counting}
+
+For "View Counts", storing 25 Million User IDs to ensure uniqueness requires $\approx 200$ MB of RAM per match.
+\[ 25,000,000 \times 8 \text{ bytes (Long)} = 200 \text{ MB} \]
+
+\subsection{HyperLogLog (HLL) - For Unique Users}
+We use HLL when we need to answer "How many \textit{unique} people are watching?".
+\begin{itemize}
+    \item \textbf{Mechanism:} Hashes the User ID and looks at the number of leading zeros in binary.
+    \item \textbf{Memory Usage:} Fixed $\approx 12$ KB.
+    \item \textbf{Accuracy:} 99.19\% accurate (Standard Error 0.81\%).
+    \item \textbf{Benefit:} We can count billions of unique users with negligible memory.
+\end{itemize}
+
+\subsection{Count-Min Sketch (CMS) - For Frequency/Top-K}
+If we need to track "Which emojis are being used the most?", we cannot use a simple counter because there are thousands of possible emojis (and infinite combinations if we consider text).
+
+\begin{itemize}
+    \item \textbf{Problem:} Tracking frequency of infinite items in limited memory.
+    \item \textbf{Structure:} A 2D array of counters (width $w$, depth $d$) and $d$ hash functions.
+    \item \textbf{Write Operation:} When an emoji "Fire" arrives:
+        \begin{itemize}
+            \item Hash it $d$ times.
+            \item Increment the counter at the hashed index for each row.
+        \end{itemize}
+    \item \textbf{Read Operation:} Hash "Fire" $d$ times again. Check the counters. Take the \textbf{minimum} value among them.
+    \item \textbf{Why Minimum?} Hash collisions cause over-counting. The minimum value is the one with the least collisions, thus the closest to the truth.
+\end{itemize}
+
+\section{Appendix: Architecture Diagram}
+
+The following diagram illustrates the complete data flow, highlighting the compression at the edge and the map-reduce pattern in the backend.
+
+\begin{figure}[htbp]
+  \centering
+  % --- PLACEHOLDER FOR ARCHITECTURE DIAGRAM ---
+  % Instructions for Student/Reader:
+  % 1. Save your Mermaid diagram as 'architecture_diagram.png'
+  % 2. Place it in the same folder as this .tex file
+  % 3. Comment out the \framebox block below
+  % 4. Uncomment the \includegraphics line below
+    
+  % UNCOMMENT THIS LINE WHEN IMAGE IS UPLOADED:
+  \includegraphics[width=1.0\textwidth]{architecture_diagram.png}
+  
+  \caption{End-to-End Distributed Counter Architecture}
+  \label{fig:arch_diagram}
+\end{figure}
+
+\end{document}
